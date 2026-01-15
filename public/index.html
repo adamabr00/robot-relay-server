@@ -1,0 +1,204 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Robot Controller</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .card { border: 1px solid #ccc; border-radius: 10px; padding: 12px; min-width: 280px; }
+    #joy {
+      width: 260px; height: 260px; border-radius: 16px;
+      border: 1px dashed #666; position: relative; touch-action: none;
+      display: flex; align-items: center; justify-content: center;
+      user-select: none;
+    }
+    #knob {
+      width: 70px; height: 70px; border-radius: 999px;
+      border: 2px solid #333; position: absolute; left: 95px; top: 95px;
+      background: rgba(0,0,0,0.06);
+    }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    button { padding: 10px 12px; font-size: 16px; }
+    input { padding: 8px; font-size: 16px; width: 100%; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <h2>Robot Controller</h2>
+
+  <div class="row">
+    <div class="card">
+      <div><b>Connection</b></div>
+      <label>Robot ID</label>
+      <input id="robotId" value="robot_001"/>
+      <label style="margin-top:8px; display:block;">Controller ID</label>
+      <input id="controllerId" value="phone_001"/>
+      <label style="margin-top:8px; display:block;">User Token</label>
+      <input id="userToken" value="user_secret"/>
+      <div style="margin-top:10px;">
+        <button id="btnConnect">Connect</button>
+        <button id="btnStop">Stop</button>
+      </div>
+      <div style="margin-top:10px;">
+        Status: <span id="status">disconnected</span><br/>
+        Robot: <span id="robotStatus">unknown</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div><b>Joystick</b></div>
+      <div id="joy">
+        <div id="knob"></div>
+        <div style="opacity:0.6;">drag</div>
+      </div>
+      <div class="mono" id="cmdOut" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card" style="flex: 1;">
+      <div><b>Telemetry</b></div>
+      <div class="mono" id="telemetry">(none)</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  let ws = null;
+  let driveInterval = null;
+
+  const elStatus = document.getElementById("status");
+  const elRobotStatus = document.getElementById("robotStatus");
+  const elTelemetry = document.getElementById("telemetry");
+  const elCmdOut = document.getElementById("cmdOut");
+
+  const robotIdEl = document.getElementById("robotId");
+  const controllerIdEl = document.getElementById("controllerId");
+  const userTokenEl = document.getElementById("userToken");
+
+  // Joystick state in [-1, 1]
+  let joyX = 0; // left/right -> angular
+  let joyY = 0; // up/down -> linear (forward is up -> negative screen y)
+
+  function wsUrl() {
+    // Works for both http and https hosting
+    const proto = (location.protocol === "https:") ? "wss:" : "ws:";
+    return `${proto}//${location.host}`;
+  }
+
+  function setStatus(s) { elStatus.textContent = s; }
+  function setRobotStatus(s) { elRobotStatus.textContent = s; }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  function connect() {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+
+    ws = new WebSocket(wsUrl());
+    setStatus("connecting...");
+
+    ws.onopen = () => {
+      setStatus("connected");
+      send({
+        type: "hello",
+        role: "controller",
+        controllerId: controllerIdEl.value.trim(),
+        wantsRobot: robotIdEl.value.trim(),
+        token: userTokenEl.value
+      });
+
+      // Send drive at 20 Hz while connected
+      if (driveInterval) clearInterval(driveInterval);
+      driveInterval = setInterval(() => {
+        // Map joystick to velocities (tune later)
+        const linear = joyY;     // forward/back
+        const angular = joyX;    // turn
+
+        elCmdOut.textContent = `drive linear=${linear.toFixed(2)} angular=${angular.toFixed(2)}`;
+        send({ type: "drive", linear, angular, ts: Date.now() });
+      }, 50);
+    };
+
+    ws.onclose = () => {
+      setStatus("disconnected");
+      setRobotStatus("unknown");
+      if (driveInterval) clearInterval(driveInterval);
+      driveInterval = null;
+    };
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+
+      if (msg.type === "robot_status") {
+        setRobotStatus(msg.online ? "online" : "offline");
+      } else if (msg.type === "telemetry" || msg.type === "status") {
+        elTelemetry.textContent = JSON.stringify(msg, null, 2);
+      } else if (msg.type === "error") {
+        elTelemetry.textContent = `ERROR: ${msg.error}`;
+      }
+    };
+  }
+
+  document.getElementById("btnConnect").onclick = connect;
+  document.getElementById("btnStop").onclick = () => send({ type: "stop", ts: Date.now() });
+
+  // Simple joystick implementation
+  const joy = document.getElementById("joy");
+  const knob = document.getElementById("knob");
+
+  const rectCenter = () => {
+    const r = joy.getBoundingClientRect();
+    return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, r: Math.min(r.width, r.height) / 2 };
+  };
+
+  function setKnob(nx, ny) {
+    // nx, ny in [-1, 1]
+    const size = 70;
+    const area = 260;
+    const max = (area - size) / 2;
+    knob.style.left = `${(area/2 - size/2) + nx * max}px`;
+    knob.style.top  = `${(area/2 - size/2) + ny * max}px`;
+  }
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  let dragging = false;
+
+  joy.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    joy.setPointerCapture(e.pointerId);
+  });
+
+  joy.addEventListener("pointerup", (e) => {
+    dragging = false;
+    joy.releasePointerCapture(e.pointerId);
+    joyX = 0; joyY = 0;
+    setKnob(0, 0);
+  });
+
+  joy.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const { cx, cy, r } = rectCenter();
+    const dx = e.clientX - cx;
+    const dy = e.clientY - cy;
+
+    // Normalize to [-1, 1]
+    let nx = clamp(dx / r, -1, 1);
+    let ny = clamp(dy / r, -1, 1);
+
+    // Screen y positive down; we want forward up => invert
+    joyX = nx;
+    joyY = -ny;
+
+    setKnob(nx, ny);
+  });
+
+  setKnob(0, 0);
+})();
+</script>
+</body>
+</html>
